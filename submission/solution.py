@@ -2,7 +2,6 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from utils import DataPoint
 
 
 class GatedResidualBlock(nn.Module):
@@ -71,12 +70,19 @@ class TradingModel_Simple(nn.Module):
 
 
 class PredictionModel:
-    def __init__(self, model_paths=["model_1.pth", "model_2.pth"]):
+    def __init__(self, t0_paths=["model_t0_1.pth", "model_t0_2.pth"], t1_paths=["model_t1_1.pth", "model_t1_2.pth"]):
         self.device = torch.device("cpu")
-        self.models = []
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        for m_path in model_paths:
-            full_path = os.path.join(base_dir, m_path)
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.models_t0 = self._load_models(t0_paths)
+        self.models_t1 = self._load_models(t1_paths)
+        self.current_seq_ix = None
+        self.h_t0 = [None] * len(self.models_t0)
+        self.h_t1 = [None] * len(self.models_t1)
+
+    def _load_models(self, paths):
+        loaded_models = []
+        for m_path in paths:
+            full_path = os.path.join(self.base_dir, m_path)
             if not os.path.exists(full_path):
                 print(f"Warning: Model file {full_path} not found.")
                 continue
@@ -86,6 +92,8 @@ class PredictionModel:
                     state_dict = raw_state["swa"]
                 elif "model" in raw_state:
                     state_dict = raw_state["model"]
+                elif "state_dict" in raw_state:
+                    state_dict = raw_state["state_dict"]
                 else:
                     state_dict = raw_state
             else:
@@ -108,28 +116,38 @@ class PredictionModel:
             except RuntimeError:
                 model.load_state_dict(clean_sd, strict=False)
             model.eval()
-            self.models.append(model)
-        self.current_seq_ix = None
-        self.hidden_states = [None] * len(self.models)
+            loaded_models.append(model)
+        return loaded_models
 
     def predict(self, data_point) -> np.ndarray:
         if self.current_seq_ix != data_point.seq_ix:
             self.current_seq_ix = data_point.seq_ix
-            self.hidden_states = [None] * len(self.models)
+            self.h_t0 = [None] * len(self.models_t0)
+            self.h_t1 = [None] * len(self.models_t1)
         x = (
             torch.tensor(data_point.state, dtype=torch.float32)
             .view(1, 1, -1)
             .to(self.device)
         )
-        total_out = None
-        with torch.no_grad():
-            for i, model in enumerate(self.models):
-                out, self.hidden_states[i] = model(x, self.hidden_states[i])
-                if total_out is None:
-                    total_out = out
-                else:
-                    total_out += out
-            avg_out = total_out / len(self.models)
+        sum_t0 = 0.0
+        if len(self.models_t0) > 0:
+            with torch.no_grad():
+                for i, model in enumerate(self.models_t0):
+                    out, self.h_t0[i] = model(x, self.h_t0[i])
+                    sum_t0 += out[:, :, 0]
+            avg_t0 = sum_t0 / len(self.models_t0)
+        else:
+            avg_t0 = torch.zeros(1, 1).to(self.device)
+        sum_t1 = 0.0
+        if len(self.models_t1) > 0:
+            with torch.no_grad():
+                for i, model in enumerate(self.models_t1):
+                    out, self.h_t1[i] = model(x, self.h_t1[i])
+                    sum_t1 += out[:, :, 1]
+            avg_t1 = sum_t1 / len(self.models_t1)
+        else:
+            avg_t1 = torch.zeros(1, 1).to(self.device)
         if not data_point.need_prediction:
             return None
-        return avg_out[0, 0, :].cpu().numpy()
+        result = torch.cat([avg_t0, avg_t1], dim=-1)
+        return result[0, :].cpu().numpy()
