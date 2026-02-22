@@ -1,0 +1,135 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from utils import DataPoint
+
+
+class GatedResidualBlock(nn.Module):
+    def __init__(self, dim, dropout=0.01):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim * 2)
+        self.glu = nn.GLU(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x = self.proj(x)
+        x = self.glu(x)
+        x = self.dropout(x)
+        return x + residual
+
+
+class TradingModel_Gated(nn.Module):
+    def __init__(self, input_dim=32, hidden_dim=128, num_layers=2, output_dim=2):
+        super().__init__()
+        self.price_indices = list(range(0, 12)) + list(range(24, 28))
+        self.vol_indices = list(range(12, 24)) + list(range(28, 32))
+        self.price_encoder = nn.Sequential(nn.Linear(16, 64), nn.SiLU())
+        self.vol_encoder = nn.Sequential(nn.Linear(16, 64), nn.SiLU())
+        self.rnn = nn.GRU(128, hidden_dim, num_layers, batch_first=True)
+        self.gated_layers = nn.Sequential(
+            GatedResidualBlock(hidden_dim), GatedResidualBlock(hidden_dim)
+        )
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, hx=None):
+        x_price = x[:, :, self.price_indices]
+        x_vol = x[:, :, self.vol_indices]
+        p_emb = self.price_encoder(x_price)
+        v_emb = self.vol_encoder(x_vol)
+        combined = torch.cat([p_emb, v_emb], dim=-1)
+        out, hx = self.rnn(combined, hx)
+        out = self.gated_layers(out)
+        out = self.fc(out)
+        return 6.0 * torch.tanh(out), hx
+
+
+class TradingModel_Simple(nn.Module):
+    def __init__(self, input_dim=32, hidden_dim=128, num_layers=2, output_dim=2):
+        super().__init__()
+        self.price_indices = list(range(0, 12)) + list(range(24, 28))
+        self.vol_indices = list(range(12, 24)) + list(range(28, 32))
+        self.price_encoder = nn.Sequential(nn.Linear(16, 64), nn.SiLU())
+        self.vol_encoder = nn.Sequential(nn.Linear(16, 64), nn.SiLU())
+        self.rnn = nn.GRU(128, hidden_dim, num_layers, batch_first=True)
+        self.glu_proj = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.glu = nn.GLU(dim=-1)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, hx=None):
+        x_price = x[:, :, self.price_indices]
+        x_vol = x[:, :, self.vol_indices]
+        p_emb = self.price_encoder(x_price)
+        v_emb = self.vol_encoder(x_vol)
+        combined = torch.cat([p_emb, v_emb], dim=-1)
+        out, hx = self.rnn(combined, hx)
+        out = self.glu_proj(out)
+        out = self.glu(out)
+        out = self.fc(out)
+        return 6.0 * torch.tanh(out), hx
+
+
+class PredictionModel:
+    def __init__(self, model_paths=["model_1.pth", "model_2.pth"]):
+        self.device = torch.device("cpu")
+        self.models = []
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for m_path in model_paths:
+            full_path = os.path.join(base_dir, m_path)
+            if not os.path.exists(full_path):
+                print(f"Warning: Model file {full_path} not found.")
+                continue
+            raw_state = torch.load(full_path, map_location=self.device)
+            if isinstance(raw_state, dict):
+                if "swa" in raw_state:
+                    state_dict = raw_state["swa"]
+                elif "model" in raw_state:
+                    state_dict = raw_state["model"]
+                else:
+                    state_dict = raw_state
+            else:
+                state_dict = raw_state
+            clean_sd = {}
+            for k, v in state_dict.items():
+                if k == "n_averaged":
+                    continue
+                new_k = k.replace("module.", "")
+                while new_k.startswith("module."):
+                    new_k = new_k.replace("module.", "")
+                clean_sd[new_k] = v
+            keys_str = " ".join(clean_sd.keys())
+            if "gated_layers" in keys_str:
+                model = TradingModel_Gated().to(self.device)
+            else:
+                model = TradingModel_Simple().to(self.device)
+            try:
+                model.load_state_dict(clean_sd, strict=True)
+            except RuntimeError:
+                model.load_state_dict(clean_sd, strict=False)
+            model.eval()
+            self.models.append(model)
+        self.current_seq_ix = None
+        self.hidden_states = [None] * len(self.models)
+
+    def predict(self, data_point) -> np.ndarray:
+        if self.current_seq_ix != data_point.seq_ix:
+            self.current_seq_ix = data_point.seq_ix
+            self.hidden_states = [None] * len(self.models)
+        x = (
+            torch.tensor(data_point.state, dtype=torch.float32)
+            .view(1, 1, -1)
+            .to(self.device)
+        )
+        total_out = None
+        with torch.no_grad():
+            for i, model in enumerate(self.models):
+                out, self.hidden_states[i] = model(x, self.hidden_states[i])
+                if total_out is None:
+                    total_out = out
+                else:
+                    total_out += out
+            avg_out = total_out / len(self.models)
+        if not data_point.need_prediction:
+            return None
+        return avg_out[0, 0, :].cpu().numpy()
