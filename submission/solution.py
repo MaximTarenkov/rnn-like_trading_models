@@ -70,7 +70,7 @@ class TradingModel_Simple(nn.Module):
 
 
 class PredictionModel:
-    def __init__(self, t0_paths=["model_t0_1.pth", "model_t0_2.pth"], t1_paths=["model_t1_1.pth", "model_t1_2.pth"]):
+    def __init__(self, t0_paths=["model_t0_0.pth", "model_t0_1.pth"], t1_paths=["model_t1_0.pth", "model_t1_1.pth"]):
         self.device = torch.device("cpu")
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.models_t0 = self._load_models(t0_paths)
