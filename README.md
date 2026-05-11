@@ -1,4 +1,4 @@
-### Final architecture :
+### Final architecture:
 1. Input feature vector (1000 steps).
 2. Split into price and volume features
 3. Forward through two independent MLPs (16 -> 64) with SiLU activation.
